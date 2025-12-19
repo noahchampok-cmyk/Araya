@@ -1,66 +1,48 @@
 import os
+import requests
 import json
-import logging
-from datetime import datetime
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from notion_client import Client
-import google.generativeai as genai
 
 app = Flask(__name__)
 
-LINE_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
-LINE_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
-NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
-NOTION_DB_ID = os.environ.get('NOTION_DATABASE_ID')
-GEMINI_KEY = os.environ.get('GEMINI_API_KEY')
+# ตั้งค่า Line Bot
+line_bot_api = LineBotApi(os.environ.get('CHANNEL_ACCESS_TOKEN'))
+handler = WebhookHandler(os.environ.get('CHANNEL_SECRET'))
 
-if not all([LINE_ACCESS_TOKEN, LINE_SECRET, NOTION_TOKEN, NOTION_DB_ID, GEMINI_KEY]):
-    print("⚠️ Warning: กุญแจบางดอกหายไป โปรดเช็คใน Render Environment Variables")
+# ตั้งค่า Notion
+notion = Client(auth=os.environ.get('NOTION_TOKEN'))
+database_id = os.environ.get('NOTION_DATABASE_ID')
 
-line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_SECRET)
-notion = Client(auth=NOTION_TOKEN)
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-pro')
-
-def ask_gemini(user_text):
-    prompt = f"""
-    Role: Personal Assistant.
-    Task: Analyze input. If it's a task, extract details for Notion. If chat, reply friendly.
-    Current Date: {datetime.now().strftime("%Y-%m-%d")}
-    Output: JSON ONLY. Format: {{"type": "task/chat", "reply": "Thai text", "task_data": {{"name": "...", "date": "YYYY-MM-DD", "category": "Work/Personal"}}}}
-    Input: "{user_text}"
-    """
+# ฟังก์ชันคุยกับ AI แบบยิงตรง (ไม่ง้อ Library)
+def chat_with_gemini(text):
+    api_key = os.environ.get('GEMINI_API_KEY')
+    # ใช้โมเดล Flash ตัวล่าสุด
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    
+    headers = {'Content-Type': 'application/json'}
+    data = {
+        "contents": [{
+            "parts": [{"text": text}]
+        }]
+    }
+    
     try:
-        response = model.generate_content(prompt)
-        clean_text = response.text.replace('```json', '').replace('```', '').strip()
-        return json.loads(clean_text)
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 200:
+            result = response.json()
+            return result['candidates'][0]['content']['parts'][0]['text']
+        else:
+            return f"ระบบขัดข้องนิดหน่อยค่ะ (Google Error: {response.status_code})"
     except Exception as e:
-        print(f"AI Error: {e}")
-        return {"type": "chat", "reply": "อารยางงนิดหน่อยขออภัยค่ะ"}
-
-def add_to_notion(data):
-    try:
-        notion.pages.create(
-            parent={"database_id": NOTION_DB_ID},
-            properties={
-                "Name": {"title": [{"text": {"content": data.get('name', 'Untitled')}}]},
-                "Status": {"select": {"name": "To Do"}},
-                "Category": {"select": {"name": data.get('category', 'Personal')}},
-                "Date": {"date": {"start": data.get('date', datetime.now().strftime("%Y-%m-%d"))}}
-            }
-        )
-        return True
-    except Exception as e:
-        print(f"Notion Error: {e}")
-        return False
+        return f"ขอโทษค่ะ อารยาป่วย (Error: {str(e)})"
 
 @app.route("/", methods=['GET'])
-def home():
-    return "Jarvis is Running on Render!", 200
+def hello():
+    return "OK", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -74,20 +56,19 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    user_text = event.message.text
-    try:
-        ai_res = ask_gemini(user_text)
-        reply = ai_res.get('reply', '...')
-        
-        if ai_res.get('type') == 'task':
-            if add_to_notion(ai_res.get('task_data')):
-                reply += "\n(บันทึกให้เรียบร้อยค่ะ)"
-            else:
-                reply += "\n(บันทึกไม่สำเร็จนะคะ)"
-                
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-    except Exception as e:
-        print(f"Error: {e}")
+    user_msg = event.message.text
+    
+    # ให้ AI คิดคำตอบ
+    ai_reply = chat_with_gemini(user_msg)
+    
+    # ส่งกลับไปหาผู้ใช้
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=ai_reply)
+    )
+
+    # (Optional) ถ้าอยากบันทึกลง Notion ด้วย ให้เปิดบรรทัดล่างนี้
+    # save_to_notion(user_msg, ai_reply)
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
